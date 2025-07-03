@@ -1,0 +1,1095 @@
+---
+title: "BR project - UCEC"
+author: "Rizzolo Maria Luce, Sanetti Caterina"
+date: "2025-06-25"
+
+output:
+  html_document:
+    toc: true                     
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    keep_md: true
+    theme: flatly                 
+    highlight: tango
+    code_folding: hide           
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+      float_menu: true
+    df_print: paged             
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,         
+  message = FALSE,     
+  warning = FALSE,     
+  #results = 'asis',    
+  fig.align = "center"
+)
+```
+
+# Introduction
+
+The dataset analyzed refers to Uterine Corpus Endometrial Carcinoma, retrieved from The Cancer Genome Atlas (TCGA). UCEC is an epithelial neoplasm arising from the innermost layer of the uterus, and is the most frequent cancer type and the second leading cause of gynecological cancer death affecting the health of women in developed countries [Vinuesa & Webster, Nat Rev Drug Discov, 2022] [Huvila et al., J Pathol, 2021]. Its molecular and histopathological characterization remains highly complex due to its heterogeneity and evolving classification systems [Morice et al., Lancet, 2016].
+
+```{r}
+# Core analysis packages
+library(biomaRt)
+library(edgeR)
+library(limma)
+
+# Visualization packages
+library(ggplot2)
+library(plotly)
+library(gplots)
+library(pheatmap)
+library(RColorBrewer)
+library(EnhancedVolcano)
+
+# Functional analysis packages
+library(gprofiler2)
+library(clusterProfiler)
+library(DOSE)
+library(enrichplot)
+library(pathview)
+library(msigdbr)
+library(fgsea)
+library(pathfindR)
+
+# Sequence analysis packages
+library(MotifDb)
+library(PWMEnrich)
+library(PWMEnrich.Hsapiens.background)
+library(Biostrings)
+
+# Annotation packages
+library(annotate)
+library(org.Hs.eg.db)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(GenomicFeatures)
+
+# Network analysis
+library(igraph)
+library(dendextend)
+
+# Data manipulation
+library(dplyr)
+library(tidyr)
+```
+
+# Load Data and Filtering
+
+The analysis started with loading the UCEC dataset, which included RNA-seq raw expression counts for 62,872 gene identifiers across multiple tumor and normal samples, annotated as *Case* or *Control*.
+
+To focus the analysis on genes with direct functional roles in cellular processes, we filtered the raw count matrix to retain only protein-coding genes. This is achieved by querying the Ensembl database via biomaRt. This step reduced the gene set from 62,872 to 22,152 protein-coding entries, corresponding to 35.2% of the original dataset.
+
+```{r i , results='asis'}
+load("Uterine_corpus_endometrial_carcinoma.rdata")
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+ensembl <- useEnsembl(
+  biomart = "genes",
+  dataset = "hsapiens_gene_ensembl",
+  mirror = "asia" 
+)
+
+all_genes <- getBM(
+  attributes = c("ensembl_gene_id", "gene_biotype"),
+  filters = "",
+  values = "", 
+  mart = ensembl
+)
+
+protein_coding_genes <- all_genes[all_genes$gene_biotype == "protein_coding",]
+
+raw_counts_pc <- raw_counts_df[rownames(raw_counts_df) %in% protein_coding_genes$ensembl_gene_id, ]
+
+r_anno_pc <- r_anno_df[r_anno_df$ensembl_gene_id %in% protein_coding_genes$ensembl_gene_id, ]
+
+cat("Original gene count:", nrow(raw_counts_df), "\n")
+cat("Protein coding genes:", nrow(raw_counts_pc), "\n")
+
+save(raw_counts_pc, c_anno_df, r_anno_pc, file = "filtered_protein_coding_data.RData")
+```
+
+We then retained only genes with raw counts greater than 20 in at least 5 samples from either the *Case* or *Control* group. This criterion helped us to remove low-abundance transcripts that are unlikely to be informative and may introduce noise. After filtering, 16,847 out of 22,152 genes were retained, corresponding to 76% of the original dataset. This refined gene set ensured us that subsequent analyses are focused on robustly expressed transcripts with potential biological relevance.
+
+```{r}
+count_thr <- 20
+sample_thr <- 5
+
+case_samples <- which(c_anno_df$condition == "case")
+control_samples <- which(c_anno_df$condition == "control")
+
+filter_vec <- apply(raw_counts_pc, 1, function(gene_counts) {
+    case_pass <- sum(gene_counts[case_samples] > count_thr) >= sample_thr
+    control_pass <- sum(gene_counts[control_samples] > count_thr) >= sample_thr
+    return(case_pass | control_pass)
+})
+
+filter_counts_df <- raw_counts_pc[filter_vec, ]
+filter_anno_df <- r_anno_pc[rownames(filter_counts_df), ]
+```
+
+## Boxplot of Filtered Counts
+
+A boxplot of the raw counts revealed substantial variation in the distribution of sequencing reads across samples, reflecting differences in library sizes and sequencing depth. This variability underscored the need of normalization to ensure that observed differences in gene expression are due to biological effects rather than technical artifacts.
+
+```{r}
+filter_counts_df <- as.data.frame(filter_counts_df)
+long_counts_df <- gather(filter_counts_df, key = "sample", value = "read_number")
+ggplot(data=long_counts_df,aes(sample,read_number+1)) +
+   geom_boxplot(colour="indianred",fill="indianred",alpha=0.7) +
+   theme_bw() +
+   scale_y_log10()+ theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)
+  ) 
+
+size_df <- data.frame("sample"=colnames(filter_counts_df),
+                    "read_millions"=colSums(filter_counts_df)/1000000)
+
+```
+
+## Normalization and CMP table
+
+Here, normalized CPM (Counts Per Million) values were calculated using the TMM (Trimmed Mean of M-values) method to correct for compositional differences between libraries. The resulting values were then rounded for readability.
+
+```{r}
+edge_c <- DGEList(counts=filter_counts_df,group=c_anno_df$condition,samples=c_anno_df,genes=filter_anno_df) 
+edge_n <- calcNormFactors(edge_c,method="TMM")
+cpm_table <- as.data.frame(round(cpm(edge_n),2))
+head(cpm_table, n=10)
+```
+
+## Boxplot of Normalized Counts
+
+The distribution of gene counts after normalization was visualized using another boxplot. The resulting values displayed well-aligned medians across all samples, indicating effective normalization, despite the presence of few outliers.
+
+```{r}
+long_cpm_df <- gather(cpm_table, key = "sample", value = "CPM") 
+
+ggplot(data=long_cpm_df,aes(sample,CPM+1)) +
+   geom_boxplot(colour="olivedrab",fill="olivedrab",alpha=0.7)+
+   theme_bw()+
+   scale_y_log10() + theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)
+  ) 
+```
+
+# Exploratory Analysis
+
+## Hierarchical Clustering
+
+To explore sample similarity, we performed hierarchical clustering using the normalized and scaled CPM data. We tested various combinations of distance metrics and linkage methods: the best separation between conditions was achieved using Manhattan distance and Ward’s method. The resulting dendrogram clearly distinguished two main clusters, corresponding to the *Case* and *Control* groups, without any sample misclassification. This clean separation supported the presence of strong condition-related differences in gene expression.
+
+```{r}
+clu_data <- t(scale(t(cpm_table)))
+dd <- dist(t(clu_data), method = "manhattan")
+hc <- hclust(dd, method = "ward.D")
+dend <- as.dendrogram(hc)
+
+condition_colors <- ifelse(c_anno_df$condition == "case", "red", "blue")
+labels_colors(dend) <- condition_colors[order.dendrogram(dend)]
+dend <- dend %>% set("labels_cex", 0.3)
+
+plot(dend, main = "Case/Control Dendrogram",
+     xlab='samples')
+legend(x = 'topright',
+       legend = c("Case", "Control"),
+       pch = c(15, 15),
+       col = c("red", "blue"))
+```
+
+## PCA
+
+We performed Principal Component Analysis (PCA) on the normalized CPM matrix to explore the global structure of the data. Using the first three principal components, which capture the majority of the variance in the dataset, we visualized the data in a 3D plot. The resulting PCA plot shows a clear separation between *Case* and *Control* groups. No sample overlaps or misgroupings were observed, further validating the results of hierarchical clustering and supporting the presence of tumor-specific transcriptional signatures.
+
+```{r}
+data.matrix <- cpm_table
+color <- ifelse(c_anno_df$condition == "case", "red", "blue")
+data.PC <- prcomp(t(data.matrix), scale. = TRUE)
+
+pca_df <- data.frame(PC1 = data.PC$x[,1],
+                     PC2 = data.PC$x[,2],
+                     PC3 = data.PC$x[,3],
+                     Condition = c_anno_df$condition,
+                     Sample = rownames(c_anno_df))
+
+plot_ly(pca_df, 
+        x = ~PC1, y = ~PC2, z = ~PC3, 
+        color = ~Condition, 
+        colors = c("blue", "red"), 
+        text = ~Sample, 
+        type = "scatter3d", 
+        mode = "markers") %>%
+  layout(scene = list(xaxis = list(title = 'PC1'),
+                      yaxis = list(title = 'PC2'),
+                      zaxis = list(title = 'PC3')))
+```
+
+# Differential Expression Analysis
+
+Differential expression testing was performed using the quasi-likelihood F-test implemented in edgeR.
+
+```{r}
+design <- model.matrix(~0+group, data=edge_n$samples)
+colnames(design) <- levels(edge_n$samples$group)
+rownames(design) <- edge_n$samples$sample
+
+edge_d <- estimateDisp(edge_n,design)
+edge_f <- glmQLFit(edge_d,design) 
+
+contro <- makeContrasts(case - control, levels = design)
+
+edge_t <- glmQLFTest(edge_f,contrast=contro)
+DEGs <- as.data.frame(topTags(edge_t,n=20,p.value = 0.25,sort.by = "logFC"))
+DEGs <- as.data.frame(topTags(edge_t,n=20000))
+DEGs$class <- "="
+DEGs$class[which(DEGs$logCPM>1&DEGs$logFC>1.5&DEGs$FDR<0.05)] = "+"
+DEGs$class[which(DEGs$logCPM>1&DEGs$logFC<(-1.5)&DEGs$FDR<0.05)] = "-"
+DEGs <- DEGs[order(DEGs$logFC,decreasing = T),]
+```
+
+```{r r , results='asis'}
+head(DEGs)
+table(DEGs$class)
+```
+
+The resulting gene-level statistics were used to classify genes based on predefined thresholds: FDR \< 0.05, log2 fold change \> 1.5 or \< –1.5, and logCPM \> 1. Each gene was annotated as up-regulated (+), down-regulated (–), or not differentially expressed (=). Based on these criteria, the analysis identified 2,333 significantly up-regulated and 1,659 significantly down-regulated genes in UCEC tumor samples compared to normal tissue.
+
+## MA Plot
+
+The MA plot helped us to visualize the relationship between gene expression level and fold change, allowing to detect potential systematic biases and highlight DEGs. Each point represented a gene, with the x-axis showing the average log2 CPM (A) and the y-axis showing the log2 fold change (M) between *Case* and *Control* groups. Genes classified as differentially expressed were colored in green, while non-significant genes were shown in grey.
+
+```{r}
+input_df <- DEGs
+xlabel <- "log2 avg CPM (A)"
+ylabel <- "log2 FC case vs Ctrl (M)"
+
+par(fig=c(0,1,0,1), mar=c(4,4,1,2), mgp=c(2, 0.75, 0))	
+plot(input_df$logCPM, input_df$logFC, xlab=xlabel, ylab=ylabel, 
+     col=ifelse(input_df$class=="=","grey70","olivedrab4"), pch=20, frame.plot=TRUE, cex=0.8, main="MA plot")
+abline(h=0,lty=2,col="grey20")
+```
+
+## Volcano Plot
+
+The volcano plot provided a summary of the differential expression analysis, highlighting the genes with the most significant changes. Genes that met both the log2 fold change and p-value thresholds were shown in red, indicating significant up- or down-regulation. Genes with a substantial fold change but lacking statistical significance appeared in green, while those with significant p-values but low fold changes were shown in blue. Grey points represented non-significant genes, which either fell below the fold change threshold, had low expression, or did not meet the significance cutoff.
+
+```{r}
+EnhancedVolcano(DEGs,
+                lab = rep("", nrow(DEGs)),
+                x = 'logFC',
+                y = 'PValue',
+                legendPosition = "right",
+                legendIconSize = 1,
+                title = 'Volcano Plot',
+                subtitle = 'Differential Expression')
+```
+
+## Heatmap
+
+The heatmap displayed the expression profiles of differentially expressed genes across all samples, providing a global view of transcriptional variation between conditions. Samples were arranged according to hierarchical clustering using Manhattan distance and Ward’s linkage method. The color scale ranged from blue (down-regulation) to red (up-regulation), allowing visual interpretation of expression patterns. Two main sample clusters emerged, clearly separating *Case* and *Control* samples. Rows represented clusters of genes with similar expression patterns across samples, potentially reflecting co-regulated gene sets or shared functional pathways.
+
+```{r}
+sig_genes <- DEGs$ensembl_gene_id[DEGs$class %in% c("+", "-")]
+heatmap_data <- as.matrix(cpm_table[rownames(cpm_table) %in% sig_genes, ])
+sample_groups <- edge_n$samples$group
+cols <- ifelse(sample_groups == "case", "red", "blue")
+cpm_degs <- as.matrix(cpm_table[which(rownames(cpm_table)%in%DEGs$ensembl_gene_id[which(DEGs$class!="=")]),])
+annotation_df <- data.frame(Group = sample_groups)
+rownames(annotation_df) <- colnames(cpm_degs)
+ann_colors <- list(
+  Group = c(case = "orange", control = "limegreen") 
+)
+heatmap_palette <- colorRampPalette(rev(brewer.pal(n = 11, name = "RdBu")))(100)
+
+pheatmap(
+  cpm_degs,
+  color = heatmap_palette,
+  scale = "row",
+  
+  annotation_col = annotation_df,
+  annotation_colors = ann_colors,
+  
+  clustering_distance_rows = "manhattan",
+  clustering_method = "ward.D",
+  
+  show_rownames = (nrow(cpm_degs) <= 50),
+  fontsize_row = 5,
+  main = "DEG Expression Heatmap\n(Case vs Control)"
+)
+```
+
+We selected the top 1,000 upregulated and 1,000 downregulated DEGs based on log2 fold change, in preparation for further analysis with STRING. Duplicated or missing Entrez IDs were removed to ensure compatibility.
+
+```{r}
+#Export DEGs in a text file
+up_DEGs <- DEGs[which(DEGs$class=="+"),]
+down_DEGs <- DEGs[which(DEGs$class=="-"),]
+
+down_sorted_degs <- down_DEGs %>% 
+  mutate(abs_log2fc = abs(logFC)) %>% 
+  arrange(desc(abs_log2fc)) %>% 
+  dplyr::select(-abs_log2fc)
+down_DEGs_1000 <- down_sorted_degs[1:1000,]
+
+up_sorted_degs <- up_DEGs %>% 
+  filter(logFC > 0) %>% 
+  arrange(desc(logFC))
+up_DEGs_1000 <- up_sorted_degs[1:1000,]
+
+ensembl <- useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl", mirror = "asia")
+convert <- getBM(attributes=c("ensembl_gene_id","entrezgene_id","external_gene_name"),
+                 filters=c("ensembl_gene_id"), 
+                 values=DEGs$ensembl_gene_id,
+                 mart = ensembl)
+
+DEGs <- merge(DEGs,convert,by.x="ensembl_gene_id",by.y="ensembl_gene_id")
+DEGs <- DEGs[which(!is.na(DEGs$entrezgene_id)),]
+DEGs <- DEGs[-which(duplicated(DEGs$entrezgene_id)),]
+```
+
+# Gene Set Enrichment Analysis
+
+The ranked gene list was prepared based on log2 fold change values for GSEA, with each gene identified by its Entrez ID. A barplot was generated to visualize the distribution of gene expression changes and verify the structure of the ranking.
+
+```{r}
+ranks <- DEGs$logFC
+names(ranks) <- DEGs$entrezgene_id
+ranks <- sort(ranks, decreasing = TRUE)
+```
+
+```{r}
+barplot(sort(ranks, decreasing = TRUE), las = 3)
+```
+
+Gene Set Enrichment Analysis was performed separately on the C4 (computational gene sets) and C6 (oncogenic signatures) collections from MSigDB.
+
+```{r}
+
+load_msigdb <- function(category, species = "Homo sapiens") {
+  msigdbr(species = species, category = category) %>%
+    split(x = .$entrez_gene, f = .$gs_name)
+}
+
+run_gsea <- function(pathways, ranks, minSize = 15, maxSize = 500) {
+  fgsea(pathways = pathways,
+        stats = ranks,
+        minSize = minSize,
+        maxSize = maxSize)
+  
+}
+
+
+#plot top pathways
+plot_top_pathways <- function(pathways, ranks, gsea_results, n = 10, gseaParam = 0.5) {
+  topUp <- gsea_results %>% filter(ES > 0) %>% top_n(n, wt = -padj)
+  topDown <- gsea_results %>% filter(ES < 0) %>% top_n(n, wt = -padj)
+  topPathways <- bind_rows(topUp, topDown)
+  
+  print(plotGseaTable(pathways[topPathways$pathway],
+                ranks,
+                gsea_results,
+                gseaParam = gseaParam))
+  
+  return(list(topUp = topUp, topDown = topDown, topPathways = topPathways))
+}
+
+#plot enrichment
+plot_enrichment <- function(pathways, ranks, pathway_name) {
+  plotEnrichment(pathways[[pathway_name]], ranks) +
+    ggtitle(paste("Enrichment of", pathway_name))
+}
+
+#load and analyze C4 and C6
+msig_c4 <- load_msigdb("C4")
+msig_c6 <- load_msigdb("C6")
+
+fgsea_c4 <- run_gsea(msig_c4, ranks)
+fgsea_c6 <- run_gsea(msig_c6, ranks)
+```
+
+## GSEA C6 Rsesults
+
+```{r}
+c6_results <- plot_top_pathways(msig_c6, ranks, fgsea_c6)
+```
+
+### ES Plot of top Up pathway
+
+```{r}
+topPathways_c6 <- c6_results$topPathways 
+
+if (nrow(c6_results$topUp) > 0) plot_enrichment(msig_c6, ranks, c6_results$topUp$pathway[1])
+```
+
+### ES Plot of top Down pathway
+
+```{r}
+if (nrow(c6_results$topDown) > 0) plot_enrichment(msig_c6, ranks, c6_results$topDown$pathway[1])
+
+```
+
+#### Top 10 Up Pathways
+
+```{r}
+topUp_c6 <- fgsea_c6 %>% filter(ES > 0) %>% top_n(10, wt=-padj)
+topDown_c6 <- fgsea_c6 %>% filter(ES < 0) %>% top_n(10, wt=-padj)
+
+topUp_c6
+```
+
+#### Top 10 Down Pathways
+
+```{r}
+topDown_c6
+```
+
+## GSEA C4 Results
+
+```{r}
+c4_results <- plot_top_pathways(msig_c4, ranks, fgsea_c4)
+```
+
+### ES Plot of top Up pathway
+
+```{r}
+topPathways_c4 <- c4_results$topPathways  
+if (nrow(c4_results$topUp) > 0) plot_enrichment(msig_c4, ranks, c4_results$topUp$pathway[1])
+```
+
+### ES Plot of top Down pathway
+
+```{r}
+
+if (nrow(c4_results$topDown) > 0) plot_enrichment(msig_c4, ranks, c4_results$topDown$pathway[1])
+
+```
+
+#### Top 10 Up Pathways
+
+```{r}
+topUp_c4 <- fgsea_c4 %>% filter(ES > 0) %>% top_n(10, wt=-padj)
+topDown_c4 <- fgsea_c4 %>% filter(ES < 0) %>% top_n(10, wt=-padj)
+
+topUp_c4
+```
+
+#### Top 10 Down Pathways
+
+```{r}
+topDown_c4
+```
+
+For each collection, the top 10 up-regulated and top 10 down-regulated pathways were identified based on adjusted p-values. The results highlighted key oncogenic programs, including AKT and MTOR signaling and enrichment for transcriptional responses such as HOXA9, NFE2L2 and ATF2. Enrichment score curves were generated to visualize selected pathways. In the C6 collection, **AKT_UP.V1_UP** showed strong positive enrichment, whereas **AKT_UP.V1_DN** was negatively enriched, confirming activation of the AKT signaling axis. In the C4 collection, the **EPITHELIAL_SENESCENCE** gene set was strongly enriched, while the **EMT_1** program appeared repressed.
+
+## Enrichment Analysis
+
+We performed functional enrichment analysis using gProfiler separately on up- and down-regulated genes, focusing on <GO:BP> and KEGG categories. For each source, the top three enriched terms were highlighted. Upregulated genes were strongly associated with mitotic cell cycle processes, cell division, and steroid biosynthesis, indicating increased proliferative activity. In contrast, downregulated genes were enriched in pathways related to system development, multicellular organization, and calcium signaling, suggesting a suppression of differentiation and signaling processes.
+
+### Up DEGs Enrichment
+
+```{r}
+run_gost_analysis <- function(gene_list, label = "Group") {
+  gostres <- gost(query = gene_list, organism = "hsapiens")
+  
+  filtered_results <- subset(gostres$result, source %in% c("GO:BP", "KEGG"))
+  
+  top_terms_by_source <- filtered_results %>%
+    group_by(source) %>%
+    slice_min(order_by = p_value, n = 3) %>%
+    ungroup() %>%
+    arrange(p_value)
+  
+  highlight_ids <- top_terms_by_source$term_id
+  
+  p <- gostplot(gostres, capped = TRUE, interactive = FALSE)
+  g<- publish_gostplot(
+    p,
+    highlight_terms = highlight_ids,
+    width = NA, height = NA,
+    filename = paste0("gostplot_", label, ".pdf")
+  )
+}
+
+run_gost_analysis(up_DEGs$external_gene_name, label = "up")
+```
+
+### Down DEGs Enrichment
+
+```{r}
+run_gost_analysis(down_DEGs$external_gene_name, label = "down")
+```
+
+### Focus on Up-regulated genes
+
+We decided to further investigate the functional implications of the up-regulated genes. Among all KEGG pathways, **Cell Cycle** emerged as the most significantly enriched, showing both high fold enrichment and consistent activation across multiple related genes. Pathway visualization revealed that most of these genes were involved in the S and G2/M phases, including key regulators of DNA replication and mitosis, such as cyclins. Notably, members of the MCM gene family, which are well known for their roles in cell proliferation and cancer progression, were up-regulated, reinforcing the hypothesis of cell cycle reactivation in the diseased condition.
+
+```{r}
+
+deg_df <- read.table("up_DEGs.txt", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+
+probe_df <- deg_df %>%
+  dplyr::select(Gene.symbol = external_gene_name,
+                logFC = logFC,
+                adj.P.Val = FDR)
+
+RA_demo <- run_pathfindR(probe_df, iterations = 10)
+
+RA_demo_clu <- cluster_enriched_terms(RA_demo)
+```
+
+#### Central Pathways
+
+```{r}
+
+target_ids <- c(
+  "hsa04114", 
+  "hsa05170", 
+  "hsa04014", 
+  "hsa05212", 
+  "hsa04530"  
+)
+
+target_cluster_names <- RA_demo_clu %>%
+  dplyr::filter(ID %in% target_ids) %>%
+  dplyr::pull(Cluster) #%>%
+  #unique()
+
+connected_clusters_data <- RA_demo_clu %>%
+dplyr::filter(Cluster %in% target_cluster_names) 
+cluster_enriched_terms(connected_clusters_data)
+```
+
+#### Cell-Cycle
+
+```{r pathview_plot, message=FALSE }
+
+logFC <- up_DEGs$logFC
+names(logFC) <- up_DEGs$ensembl_gene_id
+
+pathview(gene.data = logFC,
+         gene.idtype = "ENSEMBL",
+         pathway.id = "hsa04110", 
+         species = "human",
+         limit = list(gene=10, cpd=1))
+
+
+
+```
+
+<img src="hsa04110.pathview.png" width="700px"/>
+
+# Identify Transcription Factors
+
+We performed motif enrichment analysis to identify transcription factors with significantly enriched PWM scores in the promoter regions (500 bp upstream) of genes from the top 10 up- and down-regulated gene sets. These sets were selected from both the MSigDB C6 and C4 collections and filtered to include only genes that were also identified as differentially expressed. For each group, we generated a ranked report and visualized the top 10 enriched transcription factor motifs, displaying their sequence logos, enrichment scores, p-values, and the percentage of promoter sequences containing each motif.
+
+## C6 Gene Set
+
+```{r}
+deg_genes <- unique(DEGs$entrezgene_id)
+genes_up_all <- unique(unlist(msig_c6[topUp_c6$pathway]))
+genes_up <- intersect(genes_up_all, deg_genes)
+
+genes_down_all <- unique(unlist(msig_c6[topDown_c6$pathway]))
+genes_down <- intersect(genes_down_all, deg_genes)
+
+# Promotors from TxDb (500 nt upstream)
+genes_txdb <- genes(TxDb.Hsapiens.UCSC.hg38.knownGene)
+
+gene_map <- getBM(attributes = c("external_gene_name",'entrezgene_id'),
+                  values=names(genes_txdb),
+                  filters ='entrezgene_id',
+                  mart = ensembl)
+genes_txdb$gene_name <- gene_map$external_gene_name[match(genes_txdb$gene_id, gene_map$entrezgene_id)]
+
+# Promoters genes up- pathways
+prom_up <- promoters(genes_txdb, upstream = 500, downstream = 0)
+prom_up <- subset(prom_up, gene_id %in% genes_up)
+prom_seq_up <- getSeq(BSgenome.Hsapiens.UCSC.hg38, prom_up) 
+prom_seq_up <- lapply(prom_seq_up, DNAString)
+
+# Promoters down
+prom_down <- promoters(genes_txdb, upstream = 500, downstream = 0)
+prom_down <- subset(prom_down, gene_id %in% genes_down)
+prom_seq_down <- getSeq(BSgenome.Hsapiens.UCSC.hg38, prom_down)
+prom_seq_down <- lapply(prom_seq_down, DNAString)
+```
+
+### Motif Enrichment
+
+#### UP Regulated
+
+```{r motif_enrichment_c6, cache=TRUE , message=FALSE }
+data(PWMLogn.hg19.MotifDb.Hsap)
+enriched_up <- motifEnrichment(prom_seq_up, PWMLogn.hg19.MotifDb.Hsap, score = "affinity")
+report_up <- groupReport(enriched_up)
+plot(report_up[1:10], fontsize=7, id.fontsize=5)
+enriched_down <- motifEnrichment(prom_seq_down, PWMLogn.hg19.MotifDb.Hsap, score = "affinity")
+```
+
+#### Down Regulated
+
+```{r}
+report_down <- groupReport(enriched_down)
+plot(report_down[1:10], fontsize=7, id.fontsize=5)
+```
+
+## C4 Gene Set
+
+```{r y , message=FALSE }
+deg_genes <- unique(DEGs$entrezgene_id)
+genes_up_c4_all <- unique(unlist(msig_c4[topUp_c4$pathway]))
+genes_up_c4 <- intersect(genes_up_c4_all, deg_genes)
+genes_down_c4_all <- unique(unlist(msig_c4[topDown_c4$pathway]))
+genes_down_c4 <- intersect(genes_down_c4_all, deg_genes)
+prom_up_c4 <- promoters(genes_txdb, upstream = 500, downstream = 0)
+prom_up_c4 <- subset(prom_up_c4, gene_id %in% genes_up_c4)
+prom_seq_up_c4 <- getSeq(BSgenome.Hsapiens.UCSC.hg38, prom_up_c4)
+prom_seq_up_c4 <- lapply(prom_seq_up_c4, DNAString)
+
+prom_down_c4 <- promoters(genes_txdb, upstream = 500, downstream = 0)
+prom_down_c4 <- subset(prom_down_c4, gene_id %in% genes_down_c4)
+prom_seq_down_c4 <- getSeq(BSgenome.Hsapiens.UCSC.hg38, prom_down_c4)
+prom_seq_down_c4 <- lapply(prom_seq_down_c4, DNAString)
+```
+
+### Motif Enrichment
+
+#### UP Regulated
+
+```{r motif_enrichment_c4 , cache=TRUE}
+
+data(PWMLogn.hg19.MotifDb.Hsap)
+
+enriched_up_c4 <- motifEnrichment(prom_seq_up_c4, PWMLogn.hg19.MotifDb.Hsap, score = "affinity")
+report_up_c4 <- groupReport(enriched_up_c4)
+plot(report_up_c4[1:10], fontsize=7, id.fontsize=5)
+enriched_down_c4 <- motifEnrichment(prom_seq_down_c4, PWMLogn.hg19.MotifDb.Hsap, score = "affinity")
+```
+
+#### Down Regulated
+
+```{r}
+report_down_c4 <- groupReport(enriched_down_c4)
+plot(report_down_c4[1:10], fontsize=7, id.fontsize=5)
+```
+
+## Top-enriched TFs selection
+
+```{r}
+# C6 Reports
+report_up <- as.data.frame(groupReport(enriched_up))
+report_down <- as.data.frame(groupReport(enriched_down))
+# C4 Reports
+report_up_c4 <- as.data.frame(groupReport(enriched_up_c4))
+report_down_c4 <- as.data.frame(groupReport(enriched_down_c4))
+p_value_cutoff <- 0.05
+final_top_tf <- NULL
+cat("Searching for a Master Activator...\n")
+
+significant_c6_up <- subset(report_up, p.value < p_value_cutoff)
+significant_c4_up <- subset(report_up_c4, p.value < p_value_cutoff)
+master_activator_candidates <- intersect(significant_c6_up$id, significant_c4_up$id)
+ranking_df <- subset(significant_c6_up, id %in% master_activator_candidates)
+ranking_df$rank_c6 <- match(ranking_df$id, report_up$id)
+ranking_df$rank_c4 <- match(ranking_df$id, report_up_c4$id)
+ranking_df$average_rank <- (ranking_df$rank_c6 + ranking_df$rank_c4) / 2
+ranking_df <- ranking_df[order(ranking_df$average_rank), ]
+print(ranking_df[1:10, c("id", "p.value", "rank_c6", "rank_c4", "average_rank")])
+```
+
+### Selected TF
+
+```{r tf , results='asis' }
+final_top_tf <- ranking_df$id[1]
+final_top_tf 
+```
+
+We selected the transcription factor **NNT** as our “Master Activator” based on its consistent high ranking across multiple analyses. NNT emerged as one of the top candidates in both the C4 and C6 motif enrichment results, suggesting a central regulatory role. We then investigated its binding potential across the promoter regions of all up-regulated promoters.
+
+```{r pwm , results='asis' }
+tf <- final_top_tf
+motifs_tf <- subset(MotifDb, organism == "Hsapiens" & geneSymbol == tf)
+pwm_list <- toPWM(as.list(motifs_tf))
+names(pwm_list) = sapply(names(pwm_list), function(x) strsplit(x, "-")[[1]][3])
+```
+
+#### Empirical Cumulative Distribution Functions
+
+For this TF, we retrieved all associated Position Weight Matrices (PWMs) from MotifDb. We then computed the empirical cumulative distribution functions (ECDFs) of motif scores across all target promoter sequences to assess the overall binding potential. A confidence threshold was defined at the 99.75th percentile of the log2-transformed score distribution, allowing us to identify only the strongest and most specific predicted binding events.
+
+```{r}
+# ECDF with log2 al 99.75%
+ecdf_scores <- motifEcdf(pwm_list, organism = "hg19", quick = TRUE)
+ecdf_scores
+```
+
+#### Threshold Calculation
+
+```{r th , results='asis'}
+threshold_raw <- lapply(ecdf_scores, function(x) quantile(x, 0.9975, na.rm = TRUE))
+threshold_log2 <- log2(unlist(threshold_raw))
+threshold_log2
+```
+
+## Pattern Matching
+
+Each promoter sequence was scanned using the selected PWMs, and motif matches were identified based on the previously defined threshold. Among the promoters containing at least one significant match, we highlighted the one with the highest total binding score.
+
+This analysis identified **DRAP1** and **EZH2** as the genes with the strongest and most abundant predicted NNT binding sites within their promoter regions. These findings suggest a potential novel regulatory axis involving NNT in UCEC. DRAP1 is known to function as a transcriptional co-repressor, while EZH2 mediates histone H3 trimethylation, acting as an oncogenic epigenetic regulator, both processes that contribute to the reprogramming of cancer metabolism and aggressiveness.
+
+### C6
+
+```{r}
+
+matches <- c()
+nomatches <- c()
+best <- 0
+best_scores <- 0
+
+for (n in seq_along(prom_seq_up)) {
+  scores <- motifScores(prom_seq_up[n], pwm_list, cutoff = threshold_log2)
+  if (any(scores > 0, na.rm = TRUE)) {
+    matches <- c(matches, n)
+    total_score <- sum(scores, na.rm = TRUE)
+    if (total_score > best) {
+      best <- n
+      best_scores <- motifScores(prom_seq_up[n], pwm_list,
+                                 cutoff = threshold_log2,
+                                 raw.scores = TRUE)
+    }
+  } else {
+    nomatches <- c(nomatches, n)
+  }
+}
+
+#Entrez ID no-match promoters
+entrezlist <- names(prom_seq_up)[nomatches]
+gids <- mapIds(org.Hs.eg.db,
+               keys = entrezlist,
+               column = "SYMBOL",
+               keytype = "ENTREZID",
+               multiVals = "first")
+
+best_name <- names(prom_seq_up)[best]
+best_symbol <- mapIds(org.Hs.eg.db,
+                      keys = best_name,
+                      column = "SYMBOL",
+                      keytype = "ENTREZID",
+                      multiVals = "first")
+
+pal3 <- colorRampPalette("lightskyblue")(9)
+
+plotMotifScores(best_scores,
+                legend.cex = 0.5,
+                trans = 0.8,
+                col = pal3,
+                cutoff = threshold_log2,
+                main = paste(best_symbol, "promoter sequence "))
+```
+
+### C4
+
+```{r}
+
+matches <- c()
+nomatches <- c()
+best <- 0
+best_scores <- 0
+
+for (n in seq_along(prom_seq_up_c4)) {
+  scores <- motifScores(prom_seq_up_c4[n], pwm_list, cutoff = threshold_log2)
+  if (any(scores > 0, na.rm = TRUE)) {
+    matches <- c(matches, n)
+    total_score <- sum(scores, na.rm = TRUE)
+    if (total_score > best) {
+      best <- n
+      best_scores <- motifScores(prom_seq_up_c4[n], pwm_list,
+                                 cutoff = threshold_log2,
+                                 raw.scores = TRUE)
+    }
+  } else {
+    nomatches <- c(nomatches, n)
+  }
+}
+
+
+best_name <- names(prom_seq_up_c4)[best]
+best_symbol <- mapIds(org.Hs.eg.db,
+                      keys = best_name,
+                      column = "SYMBOL",
+                      keytype = "ENTREZID",
+                      multiVals = "first")
+
+pal3 <- colorRampPalette("lightskyblue")(9)
+
+plotMotifScores(best_scores,
+                legend.cex = 0.5,
+                trans = 0.8,
+                col = pal3,
+                cutoff = threshold_log2,
+                main = paste(best_symbol, "promoter sequence "))
+```
+
+# Network Analysis
+
+To investigate potential physical and functional interactions among differentially expressed genes, we constructed a Protein–Protein Interaction (PPI) network using the STRING database. Due to limitations of the STRING online server, we selected the top 1,000 upregulated and 1,000 downregulated genes based on absolute log2 fold change values.
+
+We explored the degree distribution of the network, visualizing both the histogram and the cumulative distribution, which confirmed the presence of hubs with high connectivity.
+
+## Degree distribution
+
+```{r}
+# Edge list
+links <- read.delim("DEGs_STRING.tsv")
+
+net <- graph_from_data_frame(d = links, directed = FALSE)
+
+# Degree distribution
+deg <- degree(net, mode = "all")
+hist(deg,
+     breaks = 30,
+     col = "skyblue",
+     main = "Nodes degree distribution",
+     xlab = "Degree")
+```
+
+## Cumulative Degree Distribution
+
+```{r}
+deg.dist <- degree_distribution(net, cumulative = TRUE, mode = "all")
+plot(x = 0:max(deg),
+     y = 1 - deg.dist,
+     pch = 19,
+     col = "orange",
+     xlab = "Degree",
+     ylab = "Cumulative frequency",
+     main = "Degree cumulative distribution")
+```
+
+### Centrality Measures
+
+Centrality analysis was then performed to compute degree, closeness, and betweenness centrality scores for all genes, and the top-ranking genes were identified for each metric. Degree and betweenness top ranked genes were also visualized exploiting cytoHubba plugin.
+
+Among them, **TNF**, **GAPDH** and **ALB** emerged as prominent hubs, displaying both high degree and high betweenness centrality. These genes were not only highly connected, but also acted as bridges between different regions of the network. While TNF is a well-known inflammatory mediator, GAPDH and ALB, despite their housekeeping and transport functions, may contribute to broader regulatory processes in UCEC.
+
+```{r}
+#degree, closeness, betweenness
+deg_cent <- degree(net)
+clo_cent <- closeness(net, normalized = TRUE)
+bet_cent <- betweenness(net, normalized = TRUE)
+
+# Top 5 for each metric
+top_deg <- sort(deg_cent, decreasing = TRUE)[1:5]
+top_clo <- sort(clo_cent, decreasing = TRUE)[1:5]
+bet_cent_rounded <- round(bet_cent, digits = 2)
+top_bet <- sort(bet_cent_rounded, decreasing = TRUE)[1:5]
+```
+
+### Top 5 genes Degree Centrality
+
+```{r}
+print(top_deg)
+```
+
+### Top 5 genes Betweenness Centrality
+
+```{r}
+print(top_bet)
+```
+
+### <img src="cyto.png" width="700px"/>
+
+### Top 5 genes Closeness Centrality
+
+```{r}
+print(top_clo)
+```
+
+## Largest Connected Component
+
+We isolated the largest connected component (LCC) of the network and characterized its structure by calculating key topological metrics, including node and edge count, average path length, network diameter, and clustering coefficient.
+
+```{r}
+comp <- components(net)
+giant <- induced_subgraph(net, which(comp$membership == which.max(comp$csize)))
+comms <- cluster_fast_greedy(giant)
+```
+
+### LCC measures
+
+```{r LCC , results='asis'}
+cat("\n LCC:\n",
+    "Nodes number:", vcount(giant), "\n",
+    "Edges number:", ecount(giant), "\n",
+    "Average path length in LCC:", mean_distance(giant, directed = FALSE), "\n",
+    "Diameter of LCC:", diameter(giant, directed = FALSE), "\n",
+    "Average clustering coefficient of LCC:", transitivity(giant, type = "average"), "\n",
+    "Number of communities detected:", length(comms), "\n")
+```
+
+### LCC plot
+
+```{r}
+plot(giant,
+     vertex.size = 5,
+     vertex.label = NA,
+     main = "LCC",
+     layout = layout_with_fr)
+```
+
+### Filtered LCC
+
+We generated a visualization of a filtered subnetwork, including only nodes with degree ≥10, to enhance interpretability. Edge confidence scores were mapped to both color and width to reflect interaction strength.
+
+```{r FLCC , results='asis'}
+net.c <- giant
+deg <- degree(net.c)
+filtered_nodes <- V(net.c)[deg >= 10]
+net.filtered <- induced_subgraph(net.c, filtered_nodes)
+components_up <- components(net)
+largest_comp <- which.max(components_up$csize)
+net.c <- induced_subgraph(net, V(net)[components_up$membership == largest_comp])
+cat("LCC:\n Nodes:", vcount(net.c), "\n Edges:", ecount(net.c), "\n")
+```
+
+```{r}
+edge_score <- E(net.c)$combined_score
+edge_size <- rep(0.00001, length(edge_score))
+edge_size[edge_score >= 500] <- 0.05
+edge_size[edge_score >= 700] <- 1
+edge_size[edge_score >= 900] <- 2
+edge_col <- rep("grey90", length(edge_score))
+edge_col[edge_score >= 500] <- "rosybrown1"
+edge_col[edge_score >= 700] <- "lightcoral"
+edge_col[edge_score >= 900] <- "deeppink1"
+deg <- degree(net.c)
+filtered_nodes <- V(net.c)[deg >= 10]
+net.filtered <- induced_subgraph(net.c, filtered_nodes)
+plot(net.filtered, 
+     edge.width = edge_size[E(net.filtered)],
+     edge.color = edge_col[E(net.filtered)],
+     vertex.color = adjustcolor("gold", alpha.f = 0.5),
+     vertex.size = 5,
+     vertex.frame.color = "black",
+     vertex.label = NA,
+     edge.curved = 0.2,
+     layout = layout_with_fr,
+     main = "LCC – nodes degree ≥ 10")
+```
+
+Community detection was performed using the fast-greedy algorithm, and the resulting modules visualized within the network.
+
+```{r fff , results='asis'}
+comms <- cluster_fast_greedy(net.filtered)
+set.seed(123)
+l <- layout_with_fr(net.filtered)
+num_communities <- length(comms)
+colors <- brewer.pal(num_communities, "Set2")
+
+cat("Number of communities detected:", length(comms), "\n")
+
+plot(comms, net.filtered,
+     layout = l,
+     main = "Community Structure in filtered LCC",
+     mark.col = alpha(colors, 0.2),    
+     mark.border = alpha(colors, 0.8),   
+     col = colors[membership(comms)],     
+     vertex.label = NA,
+     vertex.size = 3,                      
+     vertex.frame.color = alpha("gray40", 0.5), 
+     edge.width = 0.3,                     
+     edge.color = alpha("gray30", 0.15) 
+)
+```
+
+Functional interpretation of the filtered LCC was performed through GO enrichment analysis, focusing on Biological Process terms. The results revealed four major functional clusters, indicating the presence of coordinated biological programs related to intermediate metabolism and adhesion, cellular senescence, regulation of muscle ion transport and epithelial morphogenesis. These processes appeared central to the organization of our interaction network.
+
+**Community 1**
+
+```{r}
+options(ggrepel.max.overlaps = Inf) 
+community_genes <- comms[[1]]
+
+ego_BP <- enrichGO(gene = community_genes,
+                   OrgDb = org.Hs.eg.db,
+                   keyType = 'SYMBOL',
+                   ont = "BP",
+                   pAdjustMethod = "BH",
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05)
+
+x <- pairwise_termsim(ego_BP)
+emapplot(x,showCategory = 100,group = TRUE , group_style = "polygon" ,node_label = 'group' ,   nCluster=1)
+```
+
+**Community 2**
+
+```{r}
+
+community_genes <- comms[[2]]
+
+ego_BP <- enrichGO(gene = community_genes,
+                   OrgDb = org.Hs.eg.db,
+                   keyType = 'SYMBOL',
+                   ont = "BP",
+                   pAdjustMethod = "BH",
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05)
+
+x <- pairwise_termsim(ego_BP) # similarity matrix
+emapplot(x,showCategory = 100,group = TRUE , group_style = "polygon" ,node_label = 'group' ,   nCluster=1)
+
+```
+
+**Community 3**
+
+```{r}
+community_genes <- comms[[3]]
+
+ego_BP <- enrichGO(gene = community_genes,
+                   OrgDb = org.Hs.eg.db,
+                   keyType = 'SYMBOL',
+                   ont = "BP",
+                   pAdjustMethod = "BH",
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05)
+
+x <- pairwise_termsim(ego_BP) # similarity matrix
+emapplot(x,showCategory = 100,group = TRUE , group_style = "polygon" ,node_label = 'group' ,   nCluster=2)
+```
+
+**Community 4**
+
+```{r}
+
+community_genes <- comms[[4]]
+
+ego_BP <- enrichGO(gene = community_genes,
+                   OrgDb = org.Hs.eg.db,
+                   keyType = 'SYMBOL',
+                   ont = "BP",
+                   pAdjustMethod = "BH",
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05)
+
+x <- pairwise_termsim(ego_BP) # similarity matrix
+emapplot(x,showCategory = 100,group = TRUE , group_style = "polygon" ,node_label = 'group' ,   nCluster=2)
+```
+
+# Conclusions
+
+After completing all analysis steps, we obtained biologically meaningful results. A clear separation between *Case* and *Control* samples was observed through both hierarchical clustering and PCA, supporting the reliability of the dataset and normalization procedures. This enabled the identification of significantly up- and down-regulated genes, which were used for downstream analyses.
+
+GSEA highlighted strong enrichment for cell cycle related processes among upregulated genes, including activation of S and G2/M phase regulators such as cyclins and MCM family members, suggesting dysregulated proliferation, while down-regulated genes were associated with developmental and signaling pathways, indicating reduced differentiation, both hallmarks of tumor progression and metastasis.
+
+Motif enrichment analysis revealed shared transcription factor binding motifs in the promoters of both up- and down-regulated gene sets, indicating coordinated transcriptional regulation. The transcription factor **NNT** emerged as a top-ranking candidate across our gene sets, with predicted high confidence binding to the promoters of **DRAP1** and **EZH2**, suggesting a potential novel regulatory axis active in UCEC.
+
+Protein-protein interaction analysis revealed a connected network with a dense largest connected component. Centrality analysis identified **TNF**, **GAPDH**, and **ALB** as major hubs, based on both degree and betweenness scores. Community detection and functional enrichment of the LCC confirmed key biological programs, such as metabolism, senescence, ion transport, and epithelial morphogenesis.
+
+Future work may focus on the integration of multi-omics data, such as miRNA expression and epigenetic modifications, possibly from the same patient cohort, to further elucidate the regulatory mechanisms UCEC progression.
